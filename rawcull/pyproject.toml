@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rawcull"
+version = "0.2.0"
+description = "Delete RAW files whose JPG twin you already culled"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Roman Zinin" }]
+dependencies = []   # the CLI is stdlib-only; the desktop app needs the [app] extra
+
+[project.optional-dependencies]
+app = ["pywebview>=6.2"]
+trash = ["send2trash>=1.8"]
+test = ["pytest>=7"]
+
+[project.scripts]
+rawcull = "rawcull.cli:main"
+
+[project.gui-scripts]
+rawcull-gui = "rawcull.gui:main"   # no console window on Windows
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rawcull"]
+# built UI (git-ignored, produced by `npm run build` in ui/) must still ship in the wheel
+artifacts = ["src/rawcull/web/**"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

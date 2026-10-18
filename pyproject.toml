@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rawcull"
+version = "0.1.0"
+description = "Delete RAW files whose JPG twin you already culled"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Roman Zinin" }]
+dependencies = []
+
+[project.optional-dependencies]
+trash = ["send2trash>=1.8"]
+test = ["pytest>=7"]
+
+[project.scripts]
+rawcull = "rawcull.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rawcull"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

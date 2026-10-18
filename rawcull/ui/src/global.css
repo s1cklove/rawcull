@@ -1,0 +1,54 @@
+/* Same surface palette as Roman's web app (GitLab-like neutrals). Loads after
+   @mantine/core/styles.css, so at equal specificity these win.
+     --mantine-color-body           page background AND panel interior
+     --mantine-color-default        input / default-surface background
+     --mantine-color-default-hover  panel frame + hover fills
+     --app-header-bg                the top strip */
+:root[data-mantine-color-scheme='light'] {
+  --mantine-color-body: #ffffff;
+  --mantine-color-default: #ffffff;
+  --mantine-color-default-hover: #ececef;
+  --mantine-color-selected-hover: #f5f5f5;
+  --app-header-bg: #e7e5ef;
+  --app-subtle-bg: #f9f9f9;
+}
+
+:root[data-mantine-color-scheme='dark'] {
+  --mantine-color-body: #18171d;
+  --mantine-color-default: #101013;
+  --mantine-color-default-hover: #3a383f;
+  --mantine-color-selected-hover: #4a484f;
+  --app-header-bg: #26242a;
+  --app-subtle-bg: #1f1e24;
+}
+
+:root[data-mantine-color-scheme='light'] .mantine-Input-input[data-variant='default'],
+:root[data-mantine-color-scheme='dark'] .mantine-Input-input[data-variant='default'] {
+  --input-bg: var(--mantine-color-default);
+}
+
+.mantine-InputWrapper-required {
+  margin-left: calc(2px - 0.25em);
+}
+
+html, body, #root { height: 100%; }
+body { margin: 0; overflow: hidden; user-select: none; }
+
+/* desktop-app feel: no text cursor on labels, selectable where it matters */
+.selectable { user-select: text; }
+
+/* Status colours from the web app's tokens (calmer than Mantine's light variant in dark mode). */
+:root[data-mantine-color-scheme='light'] {
+  --status-warn-bg: #fff3cd; --status-warn-border: #ffc107; --status-warn-text: #856404;
+  --status-danger-bg: #f8d7da; --status-danger-border: #f5c6cb; --status-danger-text: #721c24;
+}
+:root[data-mantine-color-scheme='dark'] {
+  --status-warn-bg: #2a2010; --status-warn-border: #6a5010; --status-warn-text: #e0b060;
+  --status-danger-bg: #2a1518; --status-danger-border: #5a2025; --status-danger-text: #e07080;
+}
+.status-warn, .status-danger { border: 1px solid; }
+.status-warn { background: var(--status-warn-bg); border-color: var(--status-warn-border); }
+.status-danger { background: var(--status-danger-bg); border-color: var(--status-danger-border); }
+.status-warn, .status-warn .mantine-Alert-icon, .status-warn .mantine-Alert-title, .status-warn .mantine-Text-root { color: var(--status-warn-text); }
+.status-danger, .status-danger .mantine-Alert-icon, .status-danger .mantine-Alert-title, .status-danger .mantine-Text-root,
+.status-danger .mantine-Checkbox-label { color: var(--status-danger-text); }
