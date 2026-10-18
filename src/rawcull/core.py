@@ -112,3 +112,58 @@ def build_plan(
 
     plan.jpg_without_raw = sorted(p for k, ps in jpg_by_key.items() if k not in raw_keys for p in ps)
     return plan
+
+
+@dataclass
+class Assessment:
+    errors: list[str]    # refuse unless forced
+    warnings: list[str]  # informational
+
+    @property
+    def safe(self) -> bool:
+        return not self.errors
+
+
+def assess(plan: Plan, *, max_fraction: float = 0.95) -> Assessment:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not plan.kept_keys and plan.total_raws:
+        errors.append(f"No JPGs found in {plan.jpg_dir} — this would remove EVERY RAW. Wrong folder?")
+    elif plan.total_raws:
+        frac = len(plan.raws_to_remove) / plan.total_raws
+        if frac > max_fraction:
+            errors.append(
+                f"{frac:.0%} of RAWs would be removed (limit {max_fraction:.0%}). "
+                "If names don't match (e.g. renamed JPGs), this is a disaster."
+            )
+    if plan.jpg_without_raw:
+        warnings.append(f"{len(plan.jpg_without_raw)} JPG(s) have no matching RAW "
+                        "(shot JPG-only, or names don't match?)")
+    if plan.duplicate_jpg_keys:
+        example = ", ".join(p.name for p in next(iter(plan.duplicate_jpg_keys.values())))
+        warnings.append(f"{len(plan.duplicate_jpg_keys)} name(s) have several JPGs, e.g. {example}")
+    if plan.ignored_raw_dir:
+        warnings.append(f"{len(plan.ignored_raw_dir)} unrecognised file(s) in the RAW folder are left untouched")
+    if plan.ignored_jpg_dir:
+        warnings.append(f"{len(plan.ignored_jpg_dir)} non-JPG file(s) in the JPG folder don't count as keepers")
+    return Assessment(errors, warnings)
+
+
+def find_subdir(session: Path, names: tuple[str, ...]) -> Path | None:
+    """Find SESSION\\<name> case-insensitively (RAW, raw, Raw...); None if 0 or >1 match."""
+    if not session.is_dir():
+        return None
+    wanted = {n.casefold() for n in names}
+    hits = [c for c in session.iterdir() if c.is_dir() and c.name.casefold() in wanted]
+    return hits[0] if len(hits) == 1 else None
+
+
+def find_session_dirs(session: Path) -> tuple[Path | None, Path | None]:
+    return find_subdir(session, ("RAW",)), find_subdir(session, ("JPG", "JPEG"))
+
+
+def dirs_problem(raw: Path, jpg: Path) -> str | None:
+    raw, jpg = raw.resolve(), jpg.resolve()
+    if raw == jpg or raw in jpg.parents or jpg in raw.parents:
+        return f"RAW and JPG folders must be separate, non-nested folders ({raw} vs {jpg})"
+    return None

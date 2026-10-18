@@ -1,28 +1,26 @@
-"""Command-line interface for rawcull."""
+"""Command-line interface for rawcull. (The desktop app is rawcull.gui.)"""
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import os
-import shutil
 import sys
 from pathlib import Path
-from typing import Callable
 
 from . import __version__, winutil
+from .actions import ActionError, default_kind, make_action, write_log
 from .core import (
     DEFAULT_JPG_EXTS,
     DEFAULT_RAW_EXTS,
     DEFAULT_SIDECAR_EXTS,
     Plan,
+    assess,
     build_plan,
+    dirs_problem,
+    find_session_dirs,
 )
 
 EXIT_OK, EXIT_ERROR, EXIT_ABORTED, EXIT_UNSAFE = 0, 1, 2, 3
-
-# executor(paths) -> [(path, error message)] for files that failed
-Executor = Callable[[list[Path]], list[tuple[Path, str]]]
 
 
 # --------------------------------------------------------------------------- output helpers
@@ -43,12 +41,11 @@ class Out:
     def err(self, s: str) -> None: print(self.red("error: ") + s)
 
 
-def human(n: int) -> str:
-    f = float(n)
+def human(n: float) -> str:
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if f < 1024 or unit == "TiB":
-            return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
-        f /= 1024
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
     raise AssertionError
 
 
@@ -89,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Exit codes: 0 ok, 1 error, 2 aborted by user, 3 refused by a safety check.\n"
             "Typical use:  rawcull D:\\Photos\\2026-10-18   (preview, then confirm)\n"
-            "Or once:      rawcull --install-context-menu   then right-click the session folder."
+            "Desktop app:  rawcull-gui"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -111,8 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
     run.add_argument("-v", "--verbose", action="store_true", help="list every file, not just the first few")
     run.add_argument("--no-log", action="store_true", help="don't write rawcull-<timestamp>.log into SESSION")
-    run.add_argument("--pause", action="store_true",
-                     help="wait for Enter before exiting (keeps an Explorer-launched window open)")
+    run.add_argument("--pause", action="store_true", help="wait for Enter before exiting")
     run.add_argument("--color", choices=("auto", "always", "never"), default="auto")
 
     safety = p.add_argument_group("matching & safety")
@@ -132,79 +128,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     win = p.add_argument_group("Windows Explorer integration (current user, no admin needed)")
     win.add_argument("--install-context-menu", action="store_true",
-                     help=f"add '{winutil.MENU_TITLE}' to the folder right-click menu")
+                     help=f"add '{winutil.MENU_TITLE}' (opens the desktop app) to the folder right-click menu")
     win.add_argument("--uninstall-context-menu", action="store_true", help="remove it again")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
 
-# --------------------------------------------------------------------------- folder discovery
-def find_subdir(session: Path, names: tuple[str, ...]) -> Path | None:
-    """Find SESSION\\<name> case-insensitively (RAW, raw, Raw...)."""
-    if not session.is_dir():
-        return None
-    wanted = {n.casefold() for n in names}
-    hits = [c for c in session.iterdir() if c.is_dir() and c.name.casefold() in wanted]
-    return hits[0] if len(hits) == 1 else None
-
-
+# --------------------------------------------------------------------------- steps
 def resolve_dirs(args: argparse.Namespace, out: Out) -> tuple[Path, Path] | None:
-    session: Path = args.session
-    raw = args.raw or find_subdir(session, ("RAW",))
-    jpg = args.jpg or find_subdir(session, ("JPG", "JPEG"))
+    auto_raw, auto_jpg = find_session_dirs(args.session) if not (args.raw and args.jpg) else (None, None)
+    raw, jpg = args.raw or auto_raw, args.jpg or auto_jpg
     ok = True
     for label, d, flag in (("RAW", raw, "--raw"), ("JPG", jpg, "--jpg")):
         if d is None:
-            out.err(f"couldn't find a single {label} folder in '{session.resolve()}' (pass {flag} DIR)")
+            out.err(f"couldn't find a single {label} folder in '{args.session.resolve()}' (pass {flag} DIR)")
             ok = False
         elif not d.is_dir():
             out.err(f"{label} folder '{d}' doesn't exist or isn't a folder")
             ok = False
     if not ok:
         return None
-    raw, jpg = raw.resolve(), jpg.resolve()
-    if raw == jpg or raw in jpg.parents or jpg in raw.parents:
-        out.err(f"RAW and JPG folders must be separate, non-nested folders ({raw} vs {jpg})")
+    problem = dirs_problem(raw, jpg)
+    if problem:
+        out.err(problem)
         return None
-    return raw, jpg
-
-
-# --------------------------------------------------------------------------- safety checks
-def check_plan(plan: Plan, args: argparse.Namespace, out: Out) -> bool:
-    """Print warnings; return False if a hard check fails (unless --force)."""
-    fatal: list[str] = []
-
-    if not plan.kept_keys and plan.total_raws:
-        fatal.append(
-            f"no {'/'.join(sorted(args.jpg_ext))} files found in {plan.jpg_dir} — "
-            "this would remove EVERY RAW. Wrong folder?"
-        )
-    elif plan.total_raws:
-        frac = len(plan.raws_to_remove) / plan.total_raws
-        if frac > args.max_fraction:
-            fatal.append(
-                f"{frac:.0%} of RAWs would be removed (limit {args.max_fraction:.0%}). "
-                "If names don't match (e.g. renamed JPGs), this is a disaster. "
-                "Use --force or --max-fraction if it's intended."
-            )
-
-    if plan.jpg_without_raw:
-        out.warn(f"{len(plan.jpg_without_raw)} JPG(s) have no matching RAW "
-                 "(shot JPG-only, or names don't match?)")
-    if plan.duplicate_jpg_keys:
-        out.warn(f"{len(plan.duplicate_jpg_keys)} name(s) have several JPGs, e.g. "
-                 + ", ".join(p.name for p in next(iter(plan.duplicate_jpg_keys.values()))))
-    if plan.ignored_raw_dir:
-        out.warn(f"{len(plan.ignored_raw_dir)} unrecognised file(s) in RAW folder are left untouched")
-    if plan.ignored_jpg_dir:
-        out.warn(f"{len(plan.ignored_jpg_dir)} non-JPG file(s) in JPG folder don't count as keepers")
-
-    for msg in fatal:
-        if args.force:
-            out.warn("(forced) " + msg)
-        else:
-            out.err(msg)
-    return args.force or not fatal
+    return raw.resolve(), jpg.resolve()
 
 
 def print_summary(plan: Plan, args: argparse.Namespace, out: Out) -> None:
@@ -227,66 +175,11 @@ def print_summary(plan: Plan, args: argparse.Namespace, out: Out) -> None:
         show_list(out, "ignored in JPG folder", plan.ignored_jpg_dir, None)
 
 
-# --------------------------------------------------------------------------- execution
-def per_file(action: Callable[[Path], None]) -> Executor:
-    def run(paths: list[Path]) -> list[tuple[Path, str]]:
-        failed = []
-        for p in paths:
-            try:
-                action(p)
-            except OSError as e:
-                failed.append((p, e.strerror or str(e)))
-        return failed
-    return run
-
-
-def make_executor(args: argparse.Namespace, session: Path, out: Out) -> tuple[str, str, Executor] | None:
-    """Return (prompt verb, past-tense verb, executor) or None on setup failure."""
-    if args.move_to:
-        dest = args.move_to if args.move_to.is_absolute() else session / args.move_to
-
-        def move(p: Path) -> None:
-            dest.mkdir(parents=True, exist_ok=True)
-            target = dest / p.name
-            if target.exists():
-                raise FileExistsError(0, f"{target} already exists")
-            winutil.clear_readonly(p)  # cross-drive moves copy + delete
-            shutil.move(str(p), str(target))
-        return f"Move to {dest}", f"moved to {dest}", per_file(move)
-
-    use_trash = args.trash or (winutil.IS_WINDOWS and not args.delete)
-    if use_trash:
-        if winutil.IS_WINDOWS:
-            return "Send to Recycle Bin", "sent to the Recycle Bin", winutil.recycle
-        try:
-            from send2trash import send2trash  # type: ignore
-        except ImportError:
-            out.err("--trash outside Windows needs 'send2trash' (pip install send2trash)")
-            return None
-        return "Trash", "trashed", per_file(lambda p: send2trash(str(p)))
-
-    return "PERMANENTLY delete", "deleted", per_file(winutil.unlink_force)
-
-
 def confirm(prompt: str) -> bool:
     try:
         return input(prompt).strip().lower() in ("y", "yes", "д", "да")
     except EOFError:
         return False
-
-
-def write_log(session: Path, raw_dir: Path, jpg_dir: Path, verb: str,
-              paths: list[Path], failed: dict[Path, str], out: Out) -> None:
-    now = dt.datetime.now()
-    log = session / f"rawcull-{now:%Y%m%d-%H%M%S}.log"
-    lines = [f"# rawcull {__version__} {now.isoformat(timespec='seconds')}",
-             f"# raw={raw_dir} jpg={jpg_dir} action={verb}"]
-    lines += [f"FAIL\t{p}\t{failed[p]}" if p in failed else f"OK\t{p}" for p in paths]
-    try:
-        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print(out.dim(f"log: {log}"))
-    except OSError as e:
-        out.warn(f"couldn't write log: {e}")
 
 
 def run(args: argparse.Namespace, out: Out) -> int:
@@ -315,8 +208,16 @@ def run(args: argparse.Namespace, out: Out) -> int:
     )
     plan = build_plan(raw_dir, jpg_dir, **opts)
     print_summary(plan, args, out)
-    if not check_plan(plan, args, out):
+
+    a = assess(plan, max_fraction=args.max_fraction)
+    for w in a.warnings:
+        out.warn(w)
+    for e in a.errors:
+        (out.warn if args.force else out.err)(("(forced) " if args.force else "") + e)
+    if not a.safe and not args.force:
+        out.err("refusing. Use --force (or --max-fraction) if this is really intended.")
         return EXIT_UNSAFE
+
     if not plan.to_remove:
         print(out.green("Nothing to do — every RAW still has its JPG."))
         return EXIT_OK
@@ -324,16 +225,18 @@ def run(args: argparse.Namespace, out: Out) -> int:
         print(out.dim("dry run: nothing changed"))
         return EXIT_OK
 
-    ex = make_executor(args, session, out)
-    if ex is None:
+    kind = "move" if args.move_to else "trash" if args.trash else "delete" if args.delete else default_kind()
+    try:
+        action = make_action(kind, session, args.move_to)
+    except ActionError as e:
+        out.err(str(e))
         return EXIT_ERROR
-    prompt_verb, done_verb, execute = ex
 
     if not args.yes:
         if not sys.stdin.isatty():
             out.err("not an interactive console and no --yes given; refusing to act")
             return EXIT_ABORTED
-        if not confirm(f"{prompt_verb}: {len(plan.to_remove)} file(s)? [y/N] "):
+        if not confirm(f"{action.prompt}: {len(plan.to_remove)} file(s)? [y/N] "):
             print("Aborted, nothing changed.")
             return EXIT_ABORTED
 
@@ -343,13 +246,16 @@ def run(args: argparse.Namespace, out: Out) -> int:
         out.err("folders changed since the plan was shown; nothing was changed. Run again.")
         return EXIT_ABORTED
 
-    failed = dict(execute(plan.to_remove))
+    failed = dict(action.run(plan.to_remove, None))
     for p, why in failed.items():
         out.err(f"{p.name}: {why}")
     done = len(plan.to_remove) - len(failed)
-    print(out.green(f"{done} file(s) {done_verb}.") + (out.red(f" {len(failed)} failed.") if failed else ""))
+    print(out.green(f"{done} file(s) {action.done}.") + (out.red(f" {len(failed)} failed.") if failed else ""))
     if not args.no_log:
-        write_log(session, raw_dir, jpg_dir, done_verb, plan.to_remove, failed, out)
+        try:
+            print(out.dim(f"log: {write_log(session, raw_dir, jpg_dir, action, plan.to_remove, failed)}"))
+        except OSError as e:
+            out.warn(f"couldn't write log: {e}")
     return EXIT_ERROR if failed else EXIT_OK
 
 

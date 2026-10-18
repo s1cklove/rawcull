@@ -5,3 +5,5 @@ dist/
 build/
 result
 .venv/
+node_modules/
+src/rawcull/web/

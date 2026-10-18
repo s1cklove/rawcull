@@ -2,7 +2,7 @@ name: tests
 on: [push, pull_request]
 
 jobs:
-  test:
+  python:
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest]
@@ -15,3 +15,17 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[test]"
       - run: pytest -q -rs
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm run build      # tsc type-check + vite build
+        working-directory: ui

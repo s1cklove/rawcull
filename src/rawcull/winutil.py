@@ -108,9 +108,62 @@ MENU_TITLE = "Cull RAWs (rawcull)"
 
 
 def menu_command() -> str:
-    # pythonw.exe has no console — the menu entry must open one
-    exe = re.sub(r"pythonw\.exe$", "python.exe", sys.executable, flags=re.IGNORECASE)
-    return f'"{exe}" -m rawcull "%V" --pause'
+    """Command that opens the desktop app on the clicked folder."""
+    if getattr(sys, "frozen", False):  # running as the PyInstaller rawcull.exe
+        return f'"{sys.executable}" "%V"'
+    # pythonw.exe = no stray console window behind the app
+    exe = re.sub(r"python\.exe$", "pythonw.exe", sys.executable, flags=re.IGNORECASE)
+    return f'"{exe}" -m rawcull.gui "%V"'
+
+
+def is_context_menu_installed() -> bool:
+    if not IS_WINDOWS:
+        return False
+    import winreg
+
+    try:
+        winreg.OpenKey(winreg.HKEY_CURRENT_USER, MENU_KEYS[0] + r"\command").Close()
+        return True
+    except OSError:
+        return False
+
+
+def show_in_explorer(p: Path) -> None:
+    import subprocess
+
+    if IS_WINDOWS:
+        subprocess.Popen(["explorer", "/select,", str(p)])
+    else:
+        subprocess.Popen(["xdg-open", str(p.parent)])
+
+
+def prefers_dark() -> bool:
+    """Windows 'Choose your app mode: Dark' (used for the window colour before the page loads)."""
+    if not IS_WINDOWS:
+        return False
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except OSError:
+        return False
+
+
+def set_dpi_aware() -> None:
+    """Crisp Tk fonts on high-DPI / scaled displays instead of blurry bitmap scaling."""
+    if not IS_WINDOWS:
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # per-monitor (8.1+)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 def install_context_menu() -> None:

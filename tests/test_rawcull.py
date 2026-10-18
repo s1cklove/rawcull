@@ -181,9 +181,12 @@ def test_unlink_force_handles_readonly(tmp_path, monkeypatch):
     assert not f.exists() and len(calls) == 2
 
 
-def test_menu_command_uses_console_python(monkeypatch):
-    monkeypatch.setattr(sys, "executable", r"C:\Py\pythonw.exe")
-    assert winutil.menu_command().startswith('"C:\\Py\\python.exe" -m rawcull "%V"')
+def test_menu_command_opens_gui(monkeypatch):
+    monkeypatch.setattr(sys, "executable", r"C:\Py\python.exe")
+    assert winutil.menu_command() == '"C:\\Py\\pythonw.exe" -m rawcull.gui "%V"'
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\Apps\rawcull.exe")
+    assert winutil.menu_command() == '"C:\\Apps\\rawcull.exe" "%V"'
 
 
 @win_only
@@ -209,8 +212,121 @@ def test_context_menu_roundtrip():
     winutil.install_context_menu()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, winutil.MENU_KEYS[0] + r"\command") as k:
-            assert "-m rawcull" in winreg.QueryValueEx(k, "")[0]
+            assert "rawcull" in winreg.QueryValueEx(k, "")[0]
+        assert winutil.is_context_menu_installed()
     finally:
         winutil.uninstall_context_menu()
     with pytest.raises(FileNotFoundError):
         winreg.OpenKey(winreg.HKEY_CURRENT_USER, winutil.MENU_KEYS[0])
+
+
+# ----------------------------------------------------------------- desktop bridge (no window needed)
+import json as _json
+
+from rawcull.bridge import SessionApi, normalize_session
+
+
+@pytest.fixture
+def api_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    pushed = []
+    (tmp_path / "sess").mkdir()
+    s = make_session(tmp_path / "sess", ["A.ARW", "B.ARW", "B.ARW.xmp", "C.ARW", "D.ARW", "notes.txt"],
+                     ["A.JPG", "C.JPG", "D.JPG", "Z.JPG"])
+    api = SessionApi(push=pushed.append)
+    return api, s, pushed
+
+
+def test_normalize_session_variants(tmp_path):
+    s = make_session(tmp_path, ["A.ARW"], ["A.JPG"])
+    assert normalize_session(s / "RAW") == s
+    assert normalize_session(s / "JPG") == s
+    assert normalize_session(s / "JPG" / "A.JPG") == s     # a dropped file inside the session
+    assert normalize_session(s) == s
+
+
+def test_assess_messages(tmp_path):
+    from rawcull.core import assess
+
+    s = make_session(tmp_path, ["A.ARW", "B.ARW"], [])
+    a = assess(build_plan(s / "RAW", s / "JPG"))
+    assert not a.safe and "EVERY RAW" in a.errors[0]
+
+
+def test_bridge_snapshot_is_json_and_complete(api_env):
+    api, s, _ = api_env
+    snap = api.open_session(str(s / "JPG"))
+    _json.dumps(snap)                                          # must cross the JS bridge
+    assert snap["session"]["path"] == str(s.resolve()) and snap["problem"] is None
+    assert snap["stats"] == {"keepers": 4, "raws": 4, "kept": 3, "remove": 1, "sidecars": 1, "bytes": 200}
+    assert [f["name"] for f in snap["files"]["remove"]] == ["B.ARW", "B.ARW.xmp"]
+    assert [f["kind"] for f in snap["files"]["remove"]] == ["raw", "sidecar"]
+    assert [f["name"] for f in snap["files"]["orphan"]] == ["Z.JPG"]
+    assert [f["name"] for f in snap["files"]["ignored"]] == ["notes.txt"]
+    init = api.init()
+    assert init["snapshot"]["signature"] == snap["signature"] and init["action"] in ("trash", "delete")
+
+
+def test_bridge_remove_and_stale_signature(api_env):
+    api, s, pushed = api_env
+    snap = api.open_session(str(s))
+    (s / "JPG" / "D.JPG").unlink()                             # user kept culling; page not refreshed yet
+    r = api.remove("move", False, snap["signature"])
+    assert r["ok"] is False and r["reason"] == "stale"
+    assert names(s / "RAW") >= {"B.ARW", "D.ARW"}              # nothing touched
+    r = api.remove("move", False, r["snapshot"]["signature"])
+    assert r["ok"] and r["done"] == 3 and r["log"].startswith("rawcull-")
+    assert names(s / "_rejected") == {"B.ARW", "B.ARW.xmp", "D.ARW"}
+    assert r["snapshot"]["stats"]["remove"] == 0
+    assert any("onProgress" in js for js in pushed)
+
+
+def test_bridge_blocked_unless_forced(api_env):
+    api, s, _ = api_env
+    for f in (s / "JPG").iterdir():
+        f.unlink()
+    snap = api.rescan() if api._session else api.open_session(str(s))
+    assert snap["errors"]
+    r = api.remove("delete", False, snap["signature"])
+    assert r["reason"] == "blocked" and (s / "RAW" / "A.ARW").exists()
+    r = api.remove("delete", True, snap["signature"])
+    assert r["ok"] and r["done"] == 5
+
+
+def test_bridge_missing_folders_and_options(api_env, tmp_path):
+    api, s, _ = api_env
+    (tmp_path / "empty").mkdir()
+    assert "Couldn't find" in api.open_session(str(tmp_path / "empty"))["problem"]
+    assert "not found" in api.open_session(str(tmp_path / "nope"))["problem"]
+    api.open_session(str(s))
+    snap = api.set_options(case_sensitive=False, sidecars=False)
+    assert [f["name"] for f in snap["files"]["remove"]] == ["B.ARW"]
+    assert api.init()["options"] == {"caseSensitive": False, "sidecars": False}   # persisted
+
+
+def test_bridge_watcher_pushes_on_change(api_env):
+    api, s, pushed = api_env
+    api.open_session(str(s))
+    assert api._poll_changes() is False                       # nothing changed
+    import os, time
+    (s / "JPG" / "A.JPG").unlink()
+    st = os.stat(s / "JPG"); os.utime(s / "JPG", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert api._poll_changes() is True
+    js = pushed[-1]
+    assert js.startswith("window.rawcull && window.rawcull.onSnapshot")
+    assert '"remove": 2' in js
+    assert js.isascii()                                         # safe for every webview backend
+
+
+def test_bridge_drop(api_env):
+    api, s, pushed = api_env
+    api._handle_drop({"dataTransfer": {"files": [{"name": "C.JPG", "pywebviewFullPath": str(s / "JPG" / "C.JPG")}]}})
+    assert api._session == s.resolve() and "onSnapshot" in pushed[-1]
+    api._handle_drop({"dataTransfer": {"files": [{"name": "x"}]}})
+    assert "onDropFailed" in pushed[-1]
+
+
+def test_bridge_exposes_only_intended_methods():
+    public = {n for n in dir(SessionApi) if not n.startswith("_")}
+    assert public == {"init", "pick_session", "open_session", "pick_dir", "rescan", "set_options",
+                      "set_action", "remove", "reveal", "open_session_folder", "set_context_menu"}
